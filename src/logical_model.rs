@@ -131,8 +131,6 @@ union ShadowIP {
 }
 struct Frontend {
     icache: ICache,
-    outgoing_fill_requests: RingQueue<u32>,
-    incoming_fill_resolutions: RingQueue<IFetchBlock>,
     decode_sink: RingQueue<Pack>,
     ip: u32,
     shadow_ip: AtomicU32,
@@ -143,8 +141,6 @@ struct Frontend {
 fn new_frontend() -> Frontend {
     Frontend {
         icache: new_icache(),
-        outgoing_fill_requests: RingQueue::new(16),
-        incoming_fill_resolutions: RingQueue::new(16),
         decode_sink: RingQueue::new(32),
         ip: 0,
         shadow_ip: AtomicU32::new(0),
@@ -156,23 +152,22 @@ fn new_frontend() -> Frontend {
 struct CacheFillStation(MaybeUninit<IFetchBlock>, u32, AtomicU32);
 
 fn frontend_logic(shmem_ptr:*mut u8, lmem_ptr:*mut u8) {
-
     let mut fe = new_frontend();
     let mut fill_station = CacheFillStation(MaybeUninit::uninit(), 0, AtomicU32::new(0));
     let everything_should_stop = AtomicBool::new(false);
-
     let exe = unsafe {
         let sink = &fe.decode_sink;
         let shadow_ip = &fe.shadow_ip;
         let cf = &fe.tc_resolved;
         let should_stop_everything = &everything_should_stop;
         let lmem_ptr = lmem_ptr as usize;
+        let shmem_ptr = shmem_ptr as usize;
         std::thread::Builder::new().spawn_unchecked(move || {
             let lmem_ptr = lmem_ptr as *mut u8;
-            execution_logic(sink, shadow_ip, cf, &should_stop_everything, lmem_ptr);
+            let shmem_ptr = shmem_ptr as *mut u8;
+            execution_logic(sink, shadow_ip, cf, &should_stop_everything, lmem_ptr, shmem_ptr);
         }).unwrap()
     };
-
     let mem_server = unsafe {
         let fill_station = &raw mut fill_station;
         let fill_station = fill_station as usize;
@@ -193,6 +188,7 @@ fn frontend_logic(shmem_ptr:*mut u8, lmem_ptr:*mut u8) {
                     copy_nonoverlapping(ptr, cl.cast(), size_of::<IFetchBlock>());
                     fill_station.2.store(2, Ordering::Release);
                 }
+                //
             }
         }).unwrap()
     };
@@ -200,8 +196,6 @@ fn frontend_logic(shmem_ptr:*mut u8, lmem_ptr:*mut u8) {
     let mut is_loaded = false;
     let mut boundry_addr = 0;
     'main:loop {
-        // todo: jumps which do not cross the cache line bondry must not go through
-        // the lookup logic
         let cl_aligned_boundry = fe.ip & !((size_of::<IFetchBlock>() - 1) as u32);
         let available_locally = cl_aligned_boundry == boundry_addr;
         if !available_locally || !is_loaded {
@@ -309,12 +303,14 @@ fn frontend_logic(shmem_ptr:*mut u8, lmem_ptr:*mut u8) {
 struct PUState2 {
     gp_regs: [u32;32],
     lmem: *mut u8,
+    shmem: *mut u8,
     shadow_ip: *const AtomicU32,
     completion_flag: *const AtomicBool,
 }
 impl PUState2 {
     fn new(
         lmem_ptr: *mut u8,
+        shmem_ptr:*mut u8,
         shadow_ip: *const AtomicU32,
         completion_flag: *const AtomicBool
     ) -> Self {
@@ -322,7 +318,8 @@ impl PUState2 {
             gp_regs: [0;_],
             lmem: lmem_ptr,
             shadow_ip,
-            completion_flag
+            completion_flag,
+            shmem: shmem_ptr
         };
         return st
     }
@@ -391,32 +388,31 @@ fn proc_imm_i16_exe(
 }
 fn proc_mem_op_exe(
     pu_state:&mut PUState2,
-    insn: u16
+    insn: u16,
 ) {
     let op_code = read_opcode(&raw const insn as _);
     if matches!(op_code, Opcode::LDS) {
         // write read op to queue
-        // let arg_addr = read_i16_alu_op1_arg(insn);
-        // let args_ptr = pu_state.gp_regs[arg_addr as usize] as usize;
-        // let mop_args_ptr = unsafe { pu_state.lmem.add(args_ptr) };
-        // let LDSParams { rd, rs, byte_len, op_token_rd } = unsafe { mop_args_ptr.cast::<LDSParams>().read() };
-        // let src = unsafe { pu_state.shmem.add(rs as usize) };
-        // let dst = unsafe { pu_state.lmem.add(rd as usize) };
-        // unsafe { copy_nonoverlapping(src, dst, byte_len as usize) };
-        // pu_state.gp_regs[op_token_rd as usize] = -1i32 as u32;
-        todo!()
+        let arg_addr = read_i16_alu_op1_arg(insn);
+        let args_ptr = pu_state.gp_regs[arg_addr as usize] as usize;
+        let mop_args_ptr = unsafe { pu_state.lmem.add(args_ptr) };
+        // todo: more faithful repr???
+        let LDSParams { rd, rs, byte_len, op_token_rd } = unsafe { mop_args_ptr.cast::<LDSParams>().read() };
+        let src = unsafe { pu_state.shmem.add(rs as usize) };
+        let dst = unsafe { pu_state.lmem.add(rd as usize) };
+        unsafe { copy_nonoverlapping(src, dst, byte_len as usize) };
+        pu_state.gp_regs[op_token_rd as usize] = -1i32 as u32;
     }
     if matches!(op_code, Opcode::STS) {
         // write write op to queue
-        // let arg_addr = read_i16_alu_op1_arg(insn);
-        // let args_ptr = pu_state.gp_regs[arg_addr as usize] as usize;
-        // let mop_args_ptr = unsafe { pu_state.lmem.add(args_ptr) };
-        // let STSParams { rd, rs, byte_len, op_token_rd } = unsafe { mop_args_ptr.cast::<STSParams>().read() };
-        // let src = unsafe { pu_state.lmem.add(rs as usize) };
-        // let dst = unsafe { pu_state.shmem.add(rd as usize) };
-        // unsafe { copy_nonoverlapping(src, dst, byte_len as usize) };
-        // pu_state.gp_regs[op_token_rd as usize] = -1i32 as u32;
-        todo!()
+        let arg_addr = read_i16_alu_op1_arg(insn);
+        let args_ptr = pu_state.gp_regs[arg_addr as usize] as usize;
+        let mop_args_ptr = unsafe { pu_state.lmem.add(args_ptr) };
+        let STSParams { rd, rs, byte_len, op_token_rd } = unsafe { mop_args_ptr.cast::<STSParams>().read() };
+        let src = unsafe { pu_state.lmem.add(rs as usize) };
+        let dst = unsafe { pu_state.shmem.add(rd as usize) };
+        unsafe { copy_nonoverlapping(src, dst, byte_len as usize) };
+        pu_state.gp_regs[op_token_rd as usize] = -1i32 as u32;
     }
     if matches!(op_code, Opcode::LDV) {
         let (rd, rs) = read_i16_alu_op2_args(insn);
@@ -433,7 +429,7 @@ fn proc_mem_op_exe(
 }
 fn proc_i16x4_2(
     pu_state:&mut PUState2,
-    pack: [u16;4]
+    pack: [u16;4],
 ) {
     let [i1,i2,i3,i4] = pack;
     proc_i16_alu_exe(pu_state,i1);
@@ -552,8 +548,9 @@ fn execution_logic(
     completion_flag: *const AtomicBool,
     stop_signal: &AtomicBool,
     lmem_ptr:*mut u8,
+    shmem_ptr:*mut u8
 ) {
-    let mut state = PUState2::new(lmem_ptr, shadow_ip, completion_flag);
+    let mut state = PUState2::new(lmem_ptr, shmem_ptr, shadow_ip, completion_flag);
     let mut item = MaybeUninit::uninit();
     loop {
         if stop_signal.load(Ordering::Relaxed) {
